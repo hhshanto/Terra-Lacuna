@@ -3,3 +3,5 @@ openai>=1.0.0
 pymupdf
 pyyaml
 python-dotenv
+requests
+feedparser
