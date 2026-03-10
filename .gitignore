@@ -6,3 +6,5 @@
 /papers
 /.github
 problem.md
+__pycache__/
+*.pyc
