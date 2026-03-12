@@ -16,8 +16,22 @@ Explain contradictions and why they might exist.
 ## Gaps Worth Pursuing
 3 to 5 specific actionable gaps, each with: what the gap is, why it matters, what kind of study could address it.
 
+For each gap, include:
+- supporting papers
+- one evidence quote
+- confidence level: low, medium, or high
+- why the gap is still unresolved
+
+Include a markdown table after the bullet list with columns:
+Gap | Supporting Papers | Contradicting Papers | Proposed Study | Feasibility | Confidence
+
 ## Caveats
-What cannot be concluded from this paper set alone."""
+What cannot be concluded from this paper set alone.
+
+Rules:
+- Do not make claims without evidence from the provided comparison JSON.
+- If evidence is weak, say so explicitly.
+- Prefer uncertainty over speculation."""
 
 
 def synthesize_gaps(comparison: dict, topic: str) -> str:

@@ -75,6 +75,8 @@ fetcher:
   download_pdfs: true
   save_abstracts_as_txt: true
   pubmed_api_key: ""
+  year_from: 2020
+  year_to: 2026
 ```
 
 ### Paper sources
@@ -114,6 +116,8 @@ You can run each step separately to inspect intermediate results:
 ```bash
 # Step 0 — Fetch papers
 python main.py --topic "burnout in nurses" --step fetch
+python main.py --topic "burnout in nurses" --step fetch --year-from 2020
+python main.py --topic "burnout in nurses" --step fetch --year-from 2020 --year-to 2024
 
 # Step 1 — Extract metadata (uses papers from fetch, or specify --papers)
 python main.py --topic "burnout in nurses" --step extract

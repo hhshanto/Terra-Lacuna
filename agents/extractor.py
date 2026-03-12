@@ -13,10 +13,39 @@ EXTRACTION_PROMPT = """You are a research analyst. Extract the following from th
   "research_question": "the core question the paper tries to answer (1-2 sentences)",
   "methodology": "how they studied it e.g. RCT, survey, meta-analysis, qualitative",
   "sample": "who or what was studied -- population, size, context",
-  "key_findings": ["finding 1", "finding 2"],
-  "limitations": ["limitation the authors admit 1", "limitation 2"],
-  "what_they_did_not_study": ["gap or scope exclusion 1", "gap 2"]
-}"""
+    "key_findings": [
+        {
+            "finding": "finding statement",
+            "evidence_quote": "short quote from the paper supporting the finding",
+            "section_name": "Results|Discussion|Abstract|Unknown",
+            "page_or_paragraph_hint": "page 5|paragraph near '... '|Unknown",
+            "confidence_score": 0.0
+        }
+    ],
+    "limitations": [
+        {
+            "limitation": "limitation statement",
+            "evidence_quote": "short quote from the paper supporting the limitation",
+            "section_name": "Limitations|Discussion|Abstract|Unknown",
+            "page_or_paragraph_hint": "page 8|paragraph near '... '|Unknown",
+            "confidence_score": 0.0
+        }
+    ],
+    "what_they_did_not_study": [
+        {
+            "gap": "unstudied area or scope exclusion",
+            "evidence_quote": "short quote from the paper supporting the gap",
+            "section_name": "Discussion|Future Work|Abstract|Unknown",
+            "page_or_paragraph_hint": "page 9|paragraph near '... '|Unknown",
+            "confidence_score": 0.0
+        }
+    ]
+}
+Rules:
+- Do not infer beyond the paper text.
+- If unsupported by text, use "Not available from text".
+- confidence_score must be from 0.0 to 1.0.
+- Return JSON only."""
 
 ABSTRACT_ONLY_PROMPT = """You are a research analyst. The following text is only an abstract (not a full paper).
 Extract only what the abstract explicitly states. Return JSON only:
@@ -25,9 +54,33 @@ Extract only what the abstract explicitly states. Return JSON only:
   "research_question": "the core question (1-2 sentences)",
   "methodology": "method if mentioned, otherwise 'Not available (abstract only)'",
   "sample": "sample if mentioned, otherwise 'Not available (abstract only)'",
-  "key_findings": ["finding explicitly stated in abstract"],
-  "limitations": ["Not available (abstract only)"],
-  "what_they_did_not_study": ["Not available (abstract only)"]
+    "key_findings": [
+        {
+            "finding": "finding explicitly stated in abstract",
+            "evidence_quote": "quote from abstract",
+            "section_name": "Abstract",
+            "page_or_paragraph_hint": "Abstract",
+            "confidence_score": 0.0
+        }
+    ],
+    "limitations": [
+        {
+            "limitation": "Not available (abstract only)",
+            "evidence_quote": "Not available from text",
+            "section_name": "Abstract",
+            "page_or_paragraph_hint": "Abstract",
+            "confidence_score": 0.0
+        }
+    ],
+    "what_they_did_not_study": [
+        {
+            "gap": "Not available (abstract only)",
+            "evidence_quote": "Not available from text",
+            "section_name": "Abstract",
+            "page_or_paragraph_hint": "Abstract",
+            "confidence_score": 0.0
+        }
+    ]
 }
 Do not infer or guess fields that are not explicitly stated in the abstract."""
 
@@ -68,6 +121,7 @@ def extract_paper(paper_text: str, filename: str) -> dict:
         system_prompt=prompt,
         user_message=paper_text,
         agent_name="extractor",
+        output_schema="extractor",
     )
     extraction["source_file"] = filename
     extraction["is_abstract_only"] = is_abstract_only
@@ -90,6 +144,7 @@ def verify_extraction(paper_text: str, extraction: dict) -> dict:
         system_prompt=VERIFICATION_PROMPT,
         user_message=user_message,
         agent_name="extractor",
+        output_schema="extractor",
     )
     verified["source_file"] = filename
     verified["is_verified"] = True

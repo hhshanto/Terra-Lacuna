@@ -1,4 +1,6 @@
 import logging
+import json
+import os
 import re
 import time
 from pathlib import Path
@@ -34,6 +36,12 @@ RATE_LIMIT_SECONDS = 3
 MAX_FILENAME_LENGTH = 80
 REQUEST_TIMEOUT_SECONDS = 30
 PDF_DOWNLOAD_TIMEOUT_SECONDS = 60
+DATA_DIRECTORY = Path(__file__).resolve().parent.parent / "data"
+YEAR_PATTERN = re.compile(r"\b(19\d{2}|20\d{2})\b")
+MAX_HTTP_RETRIES = 4
+INITIAL_RETRY_BACKOFF_SECONDS = 2
+MAX_RETRY_AFTER_SECONDS = 60
+DEFAULT_USER_AGENT = "Terra-Lacuna/1.0 (research-fetcher)"
 
 
 def safe_filename(title: str) -> str:
@@ -41,6 +49,96 @@ def safe_filename(title: str) -> str:
     cleaned_name = re.sub(r"[^\w\s-]", "", title)
     cleaned_name = re.sub(r"\s+", "_", cleaned_name.strip())
     return cleaned_name[:MAX_FILENAME_LENGTH]
+
+
+def _build_request_headers(source_name: str) -> dict:
+    """Build request headers and include optional source-specific keys."""
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "application/json, application/xml, text/plain;q=0.9, */*;q=0.8",
+    }
+    if source_name == "semantic_scholar":
+        semantic_scholar_api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "").strip()
+        if semantic_scholar_api_key:
+            headers["x-api-key"] = semantic_scholar_api_key
+    return headers
+
+
+def _get_retry_wait_seconds(response: requests.Response, attempt_number: int) -> int:
+    """Return wait seconds based on Retry-After header or exponential backoff."""
+    retry_after_header = response.headers.get("Retry-After", "").strip()
+    if retry_after_header.isdigit():
+        retry_after_seconds = int(retry_after_header)
+        return max(1, min(retry_after_seconds, MAX_RETRY_AFTER_SECONDS))
+
+    backoff_seconds = INITIAL_RETRY_BACKOFF_SECONDS * (2 ** (attempt_number - 1))
+    return min(backoff_seconds, MAX_RETRY_AFTER_SECONDS)
+
+
+def _request_with_retries(
+    url: str,
+    source_name: str,
+    params: dict | None = None,
+    timeout_seconds: int = REQUEST_TIMEOUT_SECONDS,
+) -> requests.Response:
+    """Perform GET request with retry/backoff for transient HTTP failures."""
+    headers = _build_request_headers(source_name)
+    last_error = None
+
+    for attempt_number in range(1, MAX_HTTP_RETRIES + 1):
+        try:
+            response = requests.get(url, params=params, timeout=timeout_seconds, headers=headers)
+        except requests.RequestException as error:
+            last_error = error
+            if attempt_number == MAX_HTTP_RETRIES:
+                break
+            wait_seconds = INITIAL_RETRY_BACKOFF_SECONDS * (2 ** (attempt_number - 1))
+            logger.warning(
+                "%s request failed (attempt %d/%d): %s -- retrying in %ds",
+                source_name,
+                attempt_number,
+                MAX_HTTP_RETRIES,
+                error,
+                wait_seconds,
+            )
+            time.sleep(wait_seconds)
+            continue
+
+        if response.status_code == 429:
+            if attempt_number == MAX_HTTP_RETRIES:
+                response.raise_for_status()
+            wait_seconds = _get_retry_wait_seconds(response, attempt_number)
+            logger.warning(
+                "%s rate limited (429) on attempt %d/%d -- retrying in %ds",
+                source_name,
+                attempt_number,
+                MAX_HTTP_RETRIES,
+                wait_seconds,
+            )
+            time.sleep(wait_seconds)
+            continue
+
+        try:
+            response.raise_for_status()
+            return response
+        except requests.RequestException as error:
+            last_error = error
+            if attempt_number == MAX_HTTP_RETRIES:
+                break
+            wait_seconds = INITIAL_RETRY_BACKOFF_SECONDS * (2 ** (attempt_number - 1))
+            logger.warning(
+                "%s request failed with status %s (attempt %d/%d) -- retrying in %ds",
+                source_name,
+                response.status_code,
+                attempt_number,
+                MAX_HTTP_RETRIES,
+                wait_seconds,
+            )
+            time.sleep(wait_seconds)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"{source_name} request failed after retries")
 
 
 def _extract_pdf_url_from_entry(entry: dict) -> str | None:
@@ -51,14 +149,46 @@ def _extract_pdf_url_from_entry(entry: dict) -> str | None:
     return None
 
 
-def _build_paper_record(title: str, abstract: str, year, pdf_url: str | None, source: str) -> dict:
+def _build_paper_record(
+    title: str,
+    abstract: str,
+    year,
+    pdf_url: str | None,
+    source: str,
+    doi: str | None = None,
+) -> dict:
+    normalized_year = _parse_year_value(year)
     return {
         "title": title,
         "abstract": abstract,
-        "year": year,
+        "year": normalized_year,
         "pdf_url": pdf_url,
         "source": source,
+        "doi": doi,
     }
+
+
+def _parse_year_value(year_value) -> int | None:
+    """Parse year from number or text and return a normalized int year."""
+    if year_value is None:
+        return None
+
+    if isinstance(year_value, int):
+        return year_value if 1900 <= year_value <= 2100 else None
+
+    year_text = str(year_value).strip()
+    if not year_text:
+        return None
+
+    if year_text.isdigit() and len(year_text) == 4:
+        parsed_year = int(year_text)
+        return parsed_year if 1900 <= parsed_year <= 2100 else None
+
+    match = YEAR_PATTERN.search(year_text)
+    if not match:
+        return None
+    parsed_year = int(match.group(1))
+    return parsed_year if 1900 <= parsed_year <= 2100 else None
 
 
 def fetch_from_semantic_scholar(topic: str, limit: int) -> list[dict]:
@@ -66,12 +196,16 @@ def fetch_from_semantic_scholar(topic: str, limit: int) -> list[dict]:
     params = {
         "query": topic,
         "limit": limit,
-        "fields": "title,year,abstract,openAccessPdf",
+        "fields": "title,year,abstract,openAccessPdf,externalIds",
         "sort": "publicationDate:desc",
     }
     try:
-        response = requests.get(SEMANTIC_SCHOLAR_SEARCH_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
-        response.raise_for_status()
+        response = _request_with_retries(
+            SEMANTIC_SCHOLAR_SEARCH_URL,
+            "semantic_scholar",
+            params=params,
+            timeout_seconds=REQUEST_TIMEOUT_SECONDS,
+        )
     except requests.RequestException as error:
         logging.error("Semantic Scholar request failed: %s", error)
         raise
@@ -80,15 +214,18 @@ def fetch_from_semantic_scholar(topic: str, limit: int) -> list[dict]:
     results = []
     for paper in response_data.get("data", []):
         open_access_pdf = paper.get("openAccessPdf")
+        external_ids = paper.get("externalIds", {})
         pdf_url = None
         if open_access_pdf and isinstance(open_access_pdf, dict):
             pdf_url = open_access_pdf.get("url")
+
         record = _build_paper_record(
             title=paper.get("title", "Untitled"),
             abstract=paper.get("abstract", ""),
             year=paper.get("year"),
             pdf_url=pdf_url,
             source="semantic_scholar",
+            doi=external_ids.get("DOI") if isinstance(external_ids, dict) else None,
         )
         results.append(record)
 
@@ -105,8 +242,12 @@ def fetch_from_arxiv(topic: str, limit: int) -> list[dict]:
         "sortOrder": "descending",
     }
     try:
-        response = requests.get(ARXIV_QUERY_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
-        response.raise_for_status()
+        response = _request_with_retries(
+            ARXIV_QUERY_URL,
+            "arxiv",
+            params=params,
+            timeout_seconds=REQUEST_TIMEOUT_SECONDS,
+        )
     except requests.RequestException as error:
         logging.error("arXiv request failed: %s", error)
         raise
@@ -121,6 +262,7 @@ def fetch_from_arxiv(topic: str, limit: int) -> list[dict]:
             year=entry.get("published", "")[:4] or None,
             pdf_url=pdf_url,
             source="arxiv",
+            doi=entry.get("arxiv_doi"),
         )
         results.append(record)
 
@@ -141,8 +283,12 @@ def _search_pubmed_ids(topic: str, limit: int, api_key: str = "") -> list[str]:
         search_params["api_key"] = api_key
 
     try:
-        response = requests.get(PUBMED_SEARCH_URL, params=search_params, timeout=REQUEST_TIMEOUT_SECONDS)
-        response.raise_for_status()
+        response = _request_with_retries(
+            PUBMED_SEARCH_URL,
+            "pubmed_search",
+            params=search_params,
+            timeout_seconds=REQUEST_TIMEOUT_SECONDS,
+        )
     except requests.RequestException as error:
         logging.error("PubMed search request failed: %s", error)
         raise
@@ -162,8 +308,12 @@ def _fetch_pubmed_abstracts(article_ids: list[str], api_key: str = "") -> str:
         fetch_params["api_key"] = api_key
 
     try:
-        response = requests.get(PUBMED_FETCH_URL, params=fetch_params, timeout=REQUEST_TIMEOUT_SECONDS)
-        response.raise_for_status()
+        response = _request_with_retries(
+            PUBMED_FETCH_URL,
+            "pubmed_fetch",
+            params=fetch_params,
+            timeout_seconds=REQUEST_TIMEOUT_SECONDS,
+        )
     except requests.RequestException as error:
         logging.error("PubMed fetch request failed: %s", error)
         raise
@@ -191,9 +341,10 @@ def fetch_from_pubmed(topic: str, limit: int, api_key: str = "") -> list[dict]:
         record = _build_paper_record(
             title=paper_title,
             abstract=block.strip(),
-            year=None,
+            year=_parse_year_value(block),
             pdf_url=None,
             source="pubmed",
+            doi=None,
         )
         results.append(record)
 
@@ -237,6 +388,7 @@ def _score_paper_relevance(paper: dict, topic: str) -> dict | None:
             system_prompt=RELEVANCE_PROMPT,
             user_message=user_message,
             agent_name="extractor",
+            output_schema="relevance",
         )
         paper["relevance_score"] = result.get("relevance_score", 0)
         paper["relevance_reason"] = result.get("reason", "")
@@ -248,8 +400,12 @@ def _score_paper_relevance(paper: dict, topic: str) -> dict | None:
         return paper
 
 
-def filter_papers_by_relevance(papers: list[dict], topic: str, threshold: int = DEFAULT_RELEVANCE_THRESHOLD) -> list[dict]:
-    """Score each paper's relevance to the topic and drop those below the threshold."""
+def filter_papers_by_relevance(
+    papers: list[dict],
+    topic: str,
+    threshold: int = DEFAULT_RELEVANCE_THRESHOLD,
+) -> tuple[list[dict], list[dict]]:
+    """Score relevance and return kept papers plus dropped papers."""
     scored_papers = []
     for paper in papers:
         scored = _score_paper_relevance(paper, topic)
@@ -257,10 +413,11 @@ def filter_papers_by_relevance(papers: list[dict], topic: str, threshold: int = 
             scored_papers.append(scored)
 
     relevant_papers = [p for p in scored_papers if p.get("relevance_score", 0) >= threshold]
+    dropped_papers = [p for p in scored_papers if p.get("relevance_score", 0) < threshold]
     dropped_count = len(scored_papers) - len(relevant_papers)
     if dropped_count > 0:
         logger.info("Relevance filter dropped %d/%d papers (threshold=%d)", dropped_count, len(scored_papers), threshold)
-    return relevant_papers
+    return relevant_papers, dropped_papers
 
 
 def _collect_papers_from_sources(topic: str, sources: list[str], papers_per_source: int, pubmed_api_key: str) -> list[dict]:
@@ -280,10 +437,20 @@ def _collect_papers_from_sources(topic: str, sources: list[str], papers_per_sour
 
 
 def _deduplicate_papers(papers: list[dict]) -> list[dict]:
-    """Remove duplicate papers by normalized title."""
+    """Remove duplicates by DOI first, then normalized title."""
+    seen_dois = set()
     seen_titles = set()
     unique_papers = []
+
     for paper in papers:
+        normalized_doi = str(paper.get("doi", "")).strip().lower()
+        if normalized_doi:
+            if normalized_doi in seen_dois:
+                continue
+            seen_dois.add(normalized_doi)
+            unique_papers.append(paper)
+            continue
+
         normalized_title = paper["title"].lower().strip()
         if normalized_title in seen_titles:
             continue
@@ -292,11 +459,47 @@ def _deduplicate_papers(papers: list[dict]) -> list[dict]:
     return unique_papers
 
 
+def _is_paper_in_year_range(paper: dict, year_from: int | None, year_to: int | None) -> bool:
+    """Return True if paper year satisfies configured range, or year filter is not set."""
+    if year_from is None and year_to is None:
+        return True
+
+    paper_year = _parse_year_value(paper.get("year"))
+    if paper_year is None:
+        return False
+
+    if year_from is not None and paper_year < year_from:
+        return False
+    if year_to is not None and paper_year > year_to:
+        return False
+    return True
+
+
+def _filter_papers_by_year(
+    papers: list[dict],
+    year_from: int | None,
+    year_to: int | None,
+) -> tuple[list[dict], list[dict]]:
+    """Filter papers by year and return kept plus dropped records."""
+    kept_papers = []
+    dropped_papers = []
+    for paper in papers:
+        if _is_paper_in_year_range(paper, year_from, year_to):
+            kept_papers.append(paper)
+            continue
+        dropped_papers.append(paper)
+    return kept_papers, dropped_papers
+
+
 def _download_paper_pdf(pdf_url: str, destination_path: Path) -> bool:
     """Download a PDF file. Returns True on success, False on failure."""
     try:
-        pdf_response = requests.get(pdf_url, timeout=PDF_DOWNLOAD_TIMEOUT_SECONDS)
-        pdf_response.raise_for_status()
+        pdf_response = _request_with_retries(
+            pdf_url,
+            "pdf_download",
+            params=None,
+            timeout_seconds=PDF_DOWNLOAD_TIMEOUT_SECONDS,
+        )
         destination_path.write_bytes(pdf_response.content)
         return True
     except requests.RequestException as error:
@@ -336,6 +539,48 @@ def _save_single_paper(paper: dict, output_directory: Path, should_download_pdfs
     return False
 
 
+def _save_relevance_audit(
+    topic: str,
+    threshold: int,
+    year_from: int | None,
+    year_to: int | None,
+    kept_papers: list[dict],
+    dropped_papers: list[dict],
+) -> None:
+    """Save relevance scoring decisions so filtering remains transparent."""
+    DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    audit_path = DATA_DIRECTORY / "relevance_audit.json"
+    audit_data = {
+        "topic": topic,
+        "threshold": threshold,
+        "year_from": year_from,
+        "year_to": year_to,
+        "kept_count": len(kept_papers),
+        "dropped_count": len(dropped_papers),
+        "kept": [
+            {
+                "title": paper.get("title"),
+                "source": paper.get("source"),
+                "doi": paper.get("doi"),
+                "relevance_score": paper.get("relevance_score"),
+                "relevance_reason": paper.get("relevance_reason"),
+            }
+            for paper in kept_papers
+        ],
+        "dropped": [
+            {
+                "title": paper.get("title"),
+                "source": paper.get("source"),
+                "doi": paper.get("doi"),
+                "relevance_score": paper.get("relevance_score"),
+                "relevance_reason": paper.get("relevance_reason"),
+            }
+            for paper in dropped_papers
+        ],
+    }
+    audit_path.write_text(json.dumps(audit_data, indent=2), encoding="utf-8")
+
+
 def fetch_papers(topic: str, output_dir: str, config: dict) -> int:
     """Fetch papers from configured sources, filter by relevance, and save to output_dir.
 
@@ -350,14 +595,38 @@ def fetch_papers(topic: str, output_dir: str, config: dict) -> int:
     should_save_abstracts = config.get("save_abstracts_as_txt", True)
     pubmed_api_key = config.get("pubmed_api_key", "")
     relevance_threshold = config.get("relevance_threshold", DEFAULT_RELEVANCE_THRESHOLD)
+    year_from = _parse_year_value(config.get("year_from"))
+    year_to = _parse_year_value(config.get("year_to"))
 
     papers_per_source = max(1, max_papers // max(len(sources), 1))
 
     all_papers = _collect_papers_from_sources(topic, sources, papers_per_source, pubmed_api_key)
     unique_papers = _deduplicate_papers(all_papers)
+    year_filtered_papers, year_dropped_papers = _filter_papers_by_year(unique_papers, year_from, year_to)
+    if year_from is not None or year_to is not None:
+        logger.info(
+            "Year filter kept %d/%d papers (from=%s, to=%s)",
+            len(year_filtered_papers),
+            len(unique_papers),
+            year_from,
+            year_to,
+        )
 
-    filtered_papers = filter_papers_by_relevance(unique_papers, topic, threshold=relevance_threshold)
-    logger.info("After relevance filter: %d/%d papers kept", len(filtered_papers), len(unique_papers))
+    filtered_papers, dropped_papers = filter_papers_by_relevance(
+        year_filtered_papers,
+        topic,
+        threshold=relevance_threshold,
+    )
+    all_dropped_papers = year_dropped_papers + dropped_papers
+    _save_relevance_audit(
+        topic,
+        relevance_threshold,
+        year_from,
+        year_to,
+        filtered_papers,
+        all_dropped_papers,
+    )
+    logger.info("After relevance filter: %d/%d papers kept", len(filtered_papers), len(year_filtered_papers))
 
     saved_count = 0
     for paper in filtered_papers[:max_papers]:
